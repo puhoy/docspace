@@ -1,5 +1,8 @@
 # DocSpace
 
-a really crappy document management system
+a crappy cli document management system built around tesseract, fzf and ripgrep
+
+
+WIP.
 
 

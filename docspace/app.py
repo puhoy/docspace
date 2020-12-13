@@ -24,7 +24,7 @@ class Config:
         self.data_dir = Path.joinpath(Path.home(), 'docspace')
         self.text_dir = Path.joinpath(self.data_dir, '_text')
         self.text_suffix = '.txt'
-        self.md5sum_file = Path.joinpath(self.text_dir, 'md5sums.txt')
+        self.md5sum_file = Path.joinpath(self.text_dir, '.md5sums.txt')
     
     def setup(self):
         if not self.data_dir.exists():
@@ -191,14 +191,23 @@ def launch_fzf(config: Config):
     # we have to launch the preview parser as an external program
     preview_preprocess_command = '%s %s _parse_preview {} {q}' % (
         python_executable, script)
-    output = subprocess.check_output(
-        ('fzf', '--reverse', '--multi', '--ansi', '--preview', f"{preview_preprocess_command}"), input=''.join(content).encode())
-    print(output)
+    #output = subprocess.check_output(
+    #    ('fzf', '--reverse', '--multi', '--ansi', '--preview', f"{preview_preprocess_command}"), input=''.join(content).encode())
+    preview_command = "rg \
+            --ignore-case --pretty \
+            --context 10 '{q}' '{}'"
+    RG_PREFIX="rg --files-with-matches --column --line-number --no-heading --color=always --smart-case"
+    FZF_DEFAULT_COMMAND="fzf --multi --no-clear --bind 'change:reload:%s {q}' --ansi --phony --query '' --preview '%s'" % (RG_PREFIX, preview_command)
+
+    output = subprocess.check_output(shlex.split(RG_PREFIX) + ['.'], cwd=config.text_dir)
+    output = subprocess.check_output(shlex.split(FZF_DEFAULT_COMMAND), input=output, cwd=config.text_dir)
+    print(text_file_path_to_doc_path(config, Path(output.decode())))
 
 
 def text_file_path_to_doc_path(config: Config, textfilepath):
     filename = textfilepath.name
-    filename = filename[:-len(config.text_suffix)]
+    # remove our .txt suffix 
+    filename = Path(filename).with_suffix('')
     return filename
 
 

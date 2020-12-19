@@ -1,3 +1,5 @@
+
+from io import BytesIO
 import hashlib
 import shutil
 import tempfile
@@ -9,13 +11,11 @@ import sys
 import click
 import magic
 import pdf2image
-
+import docker
+from docker import DockerClient
 
 class Config:
     def __init__(self):
-        self.tesseract_template = 'docker run --rm \
-            -v "{INPUT_FILE_PATH}":"/tmp/input/{INPUT_FILE}" \
-            jitesoft/tesseract-ocr "/tmp/input/{INPUT_FILE}" stdout'
 
         self.preview_command_template = "rg \
             --ignore-case --pretty \
@@ -25,6 +25,12 @@ class Config:
         self.text_dir = Path.joinpath(self.data_dir, '_text')
         self.text_suffix = '.txt'
         self.md5sum_file = Path.joinpath(self.text_dir, '.md5sums.txt')
+
+        self.tesseract_languages = ['deu']
+
+        self.tesseract_template = 'docker run --rm \
+            -v "{INPUT_FILE_PATH}":"/tmp/input/{INPUT_FILE}" \
+            {TESSERACT_IMAGE} --dpi 600 -l {LANGUAGES} "/tmp/input/{INPUT_FILE}" stdout'
     
     def setup(self):
         if not self.data_dir.exists():
@@ -33,6 +39,47 @@ class Config:
             self.text_dir.mkdir(parents=True, exist_ok=True)
         if not self.md5sum_file.exists():
             self.md5sum_file.touch(exist_ok=True)
+
+class DockerManager:
+    def __init__(self, config: Config):
+        self.config = config
+        self.client: DockerClient = docker.from_env()
+
+        self.languages = config.tesseract_languages
+
+    def build_if_neccessary(self):
+        if not self.is_image_built():
+            click.echo(f'building tesseract image for {self.languages}...')
+            self.build_image()
+            click.echo('done!')
+
+    def get_tag(self):
+        tag = f"docspace_tesseract_{'_'.join(self.languages)}"
+        return tag
+
+    def is_image_built(self):
+        tag = self.get_tag()
+        images = self.client.images.list(tag)
+        return bool(images)
+
+    def build_image(self):
+        dockerfile = self.get_dockerfile()
+        tag = self.get_tag()
+        click.echo(f'building {tag}')
+        image = self.client.images.build(fileobj=dockerfile, tag=tag)
+        return image
+
+    def get_dockerfile(self):
+        """
+        FROM jitesoft/tesseract-ocr
+        RUN train-lang bul --fast
+        """
+        output = BytesIO()
+        output.write(b'FROM jitesoft/tesseract-ocr\n')
+        for language in self.languages:
+            output.write(f'RUN train-lang {language} --fast\n'.encode())
+        return output
+
 
 
 
@@ -56,14 +103,7 @@ def get_md5sum(file_path: Path):
 @click.argument('file_paths', type=click.Path(file_okay=True, exists=True),  nargs=-1)
 @click.pass_obj
 def _import(config: Config, file_paths):
-    for file_path in file_paths:
-        file_path = Path(file_path).absolute()
-        if file_path.is_file():
-            if is_not_imported(config, file_path):
-                content = get_content(config, file_path)
-                __import(config, file_path, content)
-            else:
-                click.echo(f'{file_path} is already imported, skipping!')
+    import_files(config, file_paths)
 
 def is_not_imported(config, file_path):
     with config.md5sum_file.open() as f:
@@ -95,7 +135,6 @@ def get_content(config: Config, file_path):
     elif mime_type == 'image/png':
         print('run tesseract, result to _text')
         content = run_tesseract(config, file_path)
-
     elif mime_type == 'image/jpeg':
         print('run tesseract, result to _text')
         content = run_tesseract(config, file_path)
@@ -107,7 +146,7 @@ def get_content(config: Config, file_path):
 
 @cli.command()
 @click.pass_obj
-def reimport_all(config: Config):
+def rescan_all(config: Config):
     if not click.confirm('this will delete your text cache - continue?', default=False):
         exit(0)
     shutil.rmtree(config.text_dir)
@@ -118,11 +157,24 @@ def reimport_all(config: Config):
     pathlist = set(pathlist) - set(Path(config.text_dir).glob('**/*'))
     pathlist = pathlist - set([config.text_dir])
     for file_path in pathlist:
-        content = get_content(config, file_path)
-        __import(config, file_path, content)
+        if file_path.is_file():
+            click.echo(f'processing {file_path}')
+            content = get_content(config, file_path)
+            write_content_for_file(config, file_path, content)
 
 
-def __import(config: Config, file_path: Path, content: str):
+def import_files(config: Config, file_paths):
+    for file_path in file_paths:
+        file_path = Path(file_path).absolute()
+        if file_path.is_file():
+            if is_not_imported(config, file_path):
+                content = get_content(config, file_path)
+                import_file(config, file_path, content)
+            else:
+                click.echo(f'{file_path} is already imported, skipping!')
+
+
+def import_file(config: Config, file_path: Path, content: str):
     file_name = file_path.name
     destination = Path.joinpath(config.data_dir, file_name)
     counter = 0
@@ -136,13 +188,20 @@ def __import(config: Config, file_path: Path, content: str):
         shutil.copy(file_path, destination)
     except shutil.SameFileError as e:
         pass
-    
-    text_file = file_name + config.text_suffix
+    write_content_for_file(config, destination, content)
+    add_md5sum(config, file_name)
+   
+def write_content_for_file(config, source_file: Path, content):
+    text_file = source_file.name + config.text_suffix
     text_path = Path.joinpath(config.text_dir, text_file)
-    print(f'creating text file to {destination}')
+    create_folders(text_path)
+    print(f'creating text file to {text_path}')
     with text_path.open(mode='w+') as f:
         f.write(content)
-    add_md5sum(config, file_path)
+
+def create_folders(file_path: Path):
+    folders = file_path.parent
+    folders.mkdir(parents=True, exist_ok=True)
 
 
 def get_txt_content(file_path):
@@ -167,11 +226,18 @@ def convert_pdf_to_images(input_path, tempdir):
     return paths
 
 def run_tesseract(config:Config, input_file_path):
+    dockermanager = DockerManager(config)
+    dockermanager.build_if_neccessary()
+    imagename = dockermanager.get_tag()
+
     input_filename = Path(input_file_path).name
     tesseract_command = shlex.split(
             config.tesseract_template.format(
                 INPUT_FILE_PATH=input_file_path, 
-                INPUT_FILE=input_filename))
+                INPUT_FILE=input_filename,
+                TESSERACT_IMAGE=imagename,
+                LANGUAGES='+'.join(config.tesseract_languages)))
+    print(tesseract_command)
     output = subprocess.check_output(tesseract_command)
     return output.decode()
 
@@ -201,6 +267,7 @@ def launch_fzf(config: Config):
 
     output = subprocess.check_output(shlex.split(RG_PREFIX) + ['.'], cwd=config.text_dir)
     output = subprocess.check_output(shlex.split(FZF_DEFAULT_COMMAND), input=output, cwd=config.text_dir)
+    print('')
     print(text_file_path_to_doc_path(config, Path(output.decode())))
 
 
@@ -216,37 +283,17 @@ def docpath_to_textfilepath(config: Config, docfilepath):
     return filename
 
 
-
-@cli.command('_parse_preview')
-@click.argument('line')
-@click.argument('current_query')
-@click.pass_obj
-def _parse_preview(config: Config, line, current_query):
-    """
-    called by fzf to get the preview
-    """
-    filename, content = line.split(':', 1)
-    filename = docpath_to_textfilepath(config, filename)
-    preview_command = shlex.split(
-        config.preview_command_template.format(filename=filename, query=content))
-    try:
-        output = subprocess.check_output(preview_command)
-        print(output.decode())
-    except subprocess.CalledProcessError as e:
-        print(e)
-    except OSError as e:
-        if e.errno == errno.ENOENT:
-            click.secho(f'error calling {preview_command}:', fg='red')
-            click.echo(e)
-            click.echo()
-            with Path(filename).open() as f:
-                print(f.read())
-
-
 @cli.command()
 @click.pass_obj
 def search(config: Config):
     launch_fzf(config)
+
+
+@cli.command()
+@click.pass_obj
+def docker_rebuild(config: Config):
+    dockermanager = DockerManager(config)
+    dockermanager.build_image()
 
 
 cli()
